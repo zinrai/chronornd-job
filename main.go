@@ -17,7 +17,6 @@ import (
 type Config struct {
 	command     string
 	executions  int
-	daemonMode  bool
 	commandArgs []string
 }
 
@@ -32,7 +31,12 @@ func parseFlags() Config {
 
 	flag.StringVar(&config.command, "command", "", "Command to execute")
 	flag.IntVar(&config.executions, "n", 10, "Number of executions per day")
-	flag.BoolVar(&config.daemonMode, "daemon", false, "Run in daemon mode")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] [-- COMMAND_ARGS]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+	}
 
 	flag.Parse()
 
@@ -50,19 +54,16 @@ func parseFlags() Config {
 	return config
 }
 
-func generateJobs(r *rand.Rand, config Config, startTime time.Time) []Job {
-	endTime := time.Date(startTime.Year(), startTime.Month(), startTime.Day(), 23, 59, 59, 0, startTime.Location())
-	if startTime.After(endTime) {
-		startTime = time.Date(startTime.Year(), startTime.Month(), startTime.Day()+1, 0, 0, 0, 0, startTime.Location())
-		endTime = endTime.Add(24 * time.Hour)
-	}
+func generateJobs(r *rand.Rand, config Config, now time.Time) []Job {
+	start := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	end := start.Add(24 * time.Hour)
 
-	timeRange := endTime.Sub(startTime).Seconds()
+	timeRange := end.Sub(start).Seconds()
 	jobs := make([]Job, config.executions)
 
 	for i := 0; i < config.executions; i++ {
 		randomSeconds := r.Float64() * timeRange
-		execTime := startTime.Add(time.Duration(randomSeconds) * time.Second)
+		execTime := start.Add(time.Duration(randomSeconds) * time.Second)
 		jobs[i] = Job{
 			execTime: execTime,
 			command:  config.command,
@@ -90,11 +91,10 @@ func executeJob(ctx context.Context, job Job) error {
 	return nil
 }
 
-func runDaemon(ctx context.Context, config Config, r *rand.Rand) error {
-	log.Printf("Starting chronornd-job (Command: %s, Executions: %d, Mode: %s)",
+func run(ctx context.Context, config Config, r *rand.Rand) error {
+	log.Printf("Starting chronornd-job (Command: %s, Executions: %d)",
 		config.command,
-		config.executions,
-		map[bool]string{true: "daemon", false: "one-time"}[config.daemonMode])
+		config.executions)
 
 	jobQueue := generateJobs(r, config, time.Now())
 	log.Println("Planned execution times:")
@@ -102,40 +102,32 @@ func runDaemon(ctx context.Context, config Config, r *rand.Rand) error {
 		log.Printf("  %s", job.execTime.Format("15:04:05"))
 	}
 
-	for {
-		if len(jobQueue) == 0 {
-			if !config.daemonMode {
-				log.Println("Daily execution completed. Exiting...")
-				return nil
-			}
-			jobQueue = generateJobs(r, config, time.Now())
-			log.Println("Generated new execution times for next period:")
-			for _, job := range jobQueue {
-				log.Printf("  %s", job.execTime.Format("15:04:05"))
-			}
+	for _, job := range jobQueue {
+		if time.Now().After(job.execTime) {
+			log.Printf("Skipping past job scheduled for %s", job.execTime.Format("15:04:05"))
+			continue
 		}
 
-		job := jobQueue[0]
-		jobQueue = jobQueue[1:]
-
 		waitDuration := time.Until(job.execTime)
-		if waitDuration > 0 {
-			log.Printf("Waiting for %v until next execution at %s",
-				waitDuration.Round(time.Second),
-				job.execTime.Format("15:04:05"))
+		timer := time.NewTimer(waitDuration)
 
-			timer := time.NewTimer(waitDuration)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return ctx.Err()
-			case <-timer.C:
-				if err := executeJob(ctx, job); err != nil {
-					log.Printf("Error: %v", err)
-				}
+		log.Printf("Waiting for %v until next execution at %s",
+			waitDuration.Round(time.Second),
+			job.execTime.Format("15:04:05"))
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+			if err := executeJob(ctx, job); err != nil {
+				log.Printf("Error executing job: %v", err)
 			}
 		}
 	}
+
+	log.Println("All jobs completed. Exiting...")
+	return nil
 }
 
 func main() {
@@ -154,7 +146,7 @@ func main() {
 		cancel()
 	}()
 
-	if err := runDaemon(ctx, config, r); err != nil && err != context.Canceled {
-		log.Fatalf("Daemon error: %v", err)
+	if err := run(ctx, config, r); err != nil && err != context.Canceled {
+		log.Fatalf("Error: %v", err)
 	}
 }

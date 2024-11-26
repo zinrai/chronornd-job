@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"sort"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -17,6 +18,7 @@ import (
 type Config struct {
 	command     string
 	executions  int
+	serialExec  bool
 	commandArgs []string
 }
 
@@ -26,11 +28,60 @@ type Job struct {
 	args     []string
 }
 
+type JobExecutor struct {
+	mu         sync.Mutex
+	serialExec bool
+	isLocked   bool
+}
+
+func NewJobExecutor(serialExec bool) *JobExecutor {
+	return &JobExecutor{
+		serialExec: serialExec,
+	}
+}
+
+func (e *JobExecutor) executeJob(ctx context.Context, job Job) error {
+	if e.serialExec {
+		if !e.tryLock() {
+			return fmt.Errorf("skipped: another job is running")
+		}
+		defer e.unlock()
+	}
+
+	cmd := exec.CommandContext(ctx, job.command, job.args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	log.Printf("Executing command: %s %v", job.command, job.args)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("command failed: %v", err)
+	}
+	log.Println("Command executed successfully")
+	return nil
+}
+
+func (e *JobExecutor) tryLock() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.isLocked {
+		return false
+	}
+	e.isLocked = true
+	return true
+}
+
+func (e *JobExecutor) unlock() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.isLocked = false
+}
+
 func parseFlags() Config {
 	var config Config
 
 	flag.StringVar(&config.command, "command", "", "Command to execute")
 	flag.IntVar(&config.executions, "n", 10, "Number of executions per day")
+	flag.BoolVar(&config.serialExec, "serial", false, "Execute jobs serially (skip if previous job is running)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] [-- COMMAND_ARGS]\n\n", os.Args[0])
@@ -78,25 +129,15 @@ func generateJobs(r *rand.Rand, config Config, now time.Time) []Job {
 	return jobs
 }
 
-func executeJob(ctx context.Context, job Job) error {
-	cmd := exec.CommandContext(ctx, job.command, job.args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	log.Printf("Executing command: %s %v", job.command, job.args)
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("command failed: %v", err)
-	}
-	log.Println("Command executed successfully")
-	return nil
-}
-
 func run(ctx context.Context, config Config, r *rand.Rand) error {
-	log.Printf("Starting chronornd-job (Command: %s, Executions: %d)",
+	log.Printf("Starting chronornd-job (Command: %s, Executions: %d, Serial: %v)",
 		config.command,
-		config.executions)
+		config.executions,
+		config.serialExec)
 
+	executor := NewJobExecutor(config.serialExec)
 	jobQueue := generateJobs(r, config, time.Now())
+
 	log.Println("Planned execution times:")
 	for _, job := range jobQueue {
 		log.Printf("  %s", job.execTime.Format("15:04:05"))
@@ -120,8 +161,13 @@ func run(ctx context.Context, config Config, r *rand.Rand) error {
 			timer.Stop()
 			return ctx.Err()
 		case <-timer.C:
-			if err := executeJob(ctx, job); err != nil {
-				log.Printf("Error executing job: %v", err)
+			if err := executor.executeJob(ctx, job); err != nil {
+				if config.serialExec && err.Error() == "skipped: another job is running" {
+					log.Printf("Skipping job at %s: previous job is still running",
+						job.execTime.Format("15:04:05"))
+				} else {
+					log.Printf("Error executing job: %v", err)
+				}
 			}
 		}
 	}

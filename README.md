@@ -4,7 +4,7 @@ A command-line tool that executes specified commands at random times throughout 
 
 ## Overview
 
-`chronrnd-job` schedules and executes commands at random times during a 24-hour period. It maintains a sorted queue of jobs and executes them sequentially at their scheduled times.
+`chronornd-job` schedules and executes commands at random times during a 24-hour period. It maintains a sorted queue of jobs and fires each one at its scheduled time.
 
 This makes it useful for:
 
@@ -21,7 +21,7 @@ Use with cron for daily scheduling:
 
 ```bash
 # Schedule 5 random executions daily with serial execution
-0 0 * * * /usr/local/bin/chronrnd-job -command="/path/to/script.sh" -n=5 -serial
+0 0 * * * /usr/local/bin/chronornd-job -command="/path/to/script.sh" -n=5 -serial
 ```
 
 ## Installation
@@ -37,7 +37,7 @@ $ go build
 Basic command format:
 
 ```bash
-$ chronrnd-job [OPTIONS] [-- COMMAND_ARGS]
+$ chronornd-job [OPTIONS] [-- COMMAND_ARGS]
 ```
 
 ### Options
@@ -53,25 +53,25 @@ $ chronrnd-job [OPTIONS] [-- COMMAND_ARGS]
 Run a backup script 5 times throughout the day:
 
 ```bash
-$ chronrnd-job -command="./backup.sh" -n=5
+$ chronornd-job -command="./backup.sh" -n=5
 ```
 
 Execute rsync with arguments 3 times:
 
 ```bash
-$ chronrnd-job -command="rsync" -n=3 -- -av /src /dst
+$ chronornd-job -command="rsync" -n=3 -- -av /src /dst
 ```
 
 Execute shell commands with pipes:
 
 ```bash
-$ chronrnd-job -command="sh" -n=2 -- -c "date | tee /tmp/timestamp.log"
+$ chronornd-job -command="sh" -n=2 -- -c "date | tee /tmp/timestamp.log"
 ```
 
 Run in serial mode (skip jobs if previous is still running):
 
 ```bash
-$ chronrnd-job -command="./long-running-task.sh" -n=5 -serial
+$ chronornd-job -command="./long-running-task.sh" -n=5 -serial
 ```
 
 ## Design
@@ -79,8 +79,8 @@ $ chronrnd-job -command="./long-running-task.sh" -n=5 -serial
 ### Features
 
 - **Random Scheduling**: Jobs are scheduled at random times throughout the day
-- **Sequential Execution**: Jobs are executed in chronological order
-- **Serial Execution Mode**: Optional mode to skip jobs if previous job is still running
+- **Accurate Firing**: Each job fires at its scheduled wall-clock time without drift, even if an earlier job is still running
+- **Serial Execution Mode**: Optional mode to skip a job if the previous job is still running
 - **Signal Handling**: Graceful shutdown on SIGINT and SIGTERM
 - **Command Arguments**: Full support for command-line arguments and pipes
 
@@ -90,8 +90,8 @@ The program uses a simple queue-based design:
 
 1. Generates the specified number of random execution times
 2. Sorts them chronologically
-3. Executes jobs sequentially from the queue
-4. In serial mode, skips jobs if previous job is still running
+3. Waits for each scheduled time and fires the job in the background, so firing never drifts behind a long-running job
+4. In serial mode, skips a job if the previous job is still running
 
 ### Logging
 

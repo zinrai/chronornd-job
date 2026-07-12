@@ -15,6 +15,12 @@ import (
 	"time"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 type Config struct {
 	command     string
 	executions  int
@@ -29,59 +35,56 @@ type Job struct {
 }
 
 type JobExecutor struct {
-	mu         sync.Mutex
-	serialExec bool
-	isLocked   bool
+	serial  bool
+	mu      sync.Mutex
+	running bool
 }
 
-func NewJobExecutor(serialExec bool) *JobExecutor {
-	return &JobExecutor{
-		serialExec: serialExec,
+// begin reports whether a job may start now. In serial mode it returns false
+// while a previous job is still running, so the caller skips this occurrence.
+func (e *JobExecutor) begin() bool {
+	if !e.serial {
+		return true
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.running {
+		return false
+	}
+	e.running = true
+	return true
 }
 
-func (e *JobExecutor) executeJob(ctx context.Context, job Job) error {
-	if e.serialExec {
-		if !e.tryLock() {
-			return fmt.Errorf("skipped: another job is running")
-		}
-		defer e.unlock()
+func (e *JobExecutor) end() {
+	if !e.serial {
+		return
 	}
+	e.mu.Lock()
+	e.running = false
+	e.mu.Unlock()
+}
 
+func (e *JobExecutor) execute(ctx context.Context, job Job) {
 	cmd := exec.CommandContext(ctx, job.command, job.args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	log.Printf("Executing command: %s %v", job.command, job.args)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("command failed: %v", err)
+		log.Printf("Error executing job: %v", err)
+		return
 	}
 	log.Println("Command executed successfully")
-	return nil
-}
-
-func (e *JobExecutor) tryLock() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.isLocked {
-		return false
-	}
-	e.isLocked = true
-	return true
-}
-
-func (e *JobExecutor) unlock() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.isLocked = false
 }
 
 func parseFlags() Config {
 	var config Config
+	var showVersion bool
 
 	flag.StringVar(&config.command, "command", "", "Command to execute")
 	flag.IntVar(&config.executions, "n", 10, "Number of executions per day")
 	flag.BoolVar(&config.serialExec, "serial", false, "Execute jobs serially (skip if previous job is running)")
+	flag.BoolVar(&showVersion, "version", false, "Print version information and exit")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [OPTIONS] [-- COMMAND_ARGS]\n\n", os.Args[0])
@@ -90,6 +93,11 @@ func parseFlags() Config {
 	}
 
 	flag.Parse()
+
+	if showVersion {
+		fmt.Printf("chronornd-job version %s (commit: %s, built: %s)\n", version, commit, date)
+		os.Exit(0)
+	}
 
 	if config.command == "" {
 		config.command = "echo"
@@ -135,7 +143,7 @@ func run(ctx context.Context, config Config, r *rand.Rand) error {
 		config.executions,
 		config.serialExec)
 
-	executor := NewJobExecutor(config.serialExec)
+	executor := &JobExecutor{serial: config.serialExec}
 	jobQueue := generateJobs(r, config, time.Now())
 
 	log.Println("Planned execution times:")
@@ -143,6 +151,7 @@ func run(ctx context.Context, config Config, r *rand.Rand) error {
 		log.Printf("  %s", job.execTime.Format("15:04:05"))
 	}
 
+	var wg sync.WaitGroup
 	for _, job := range jobQueue {
 		if time.Now().After(job.execTime) {
 			log.Printf("Skipping past job scheduled for %s", job.execTime.Format("15:04:05"))
@@ -159,19 +168,24 @@ func run(ctx context.Context, config Config, r *rand.Rand) error {
 		select {
 		case <-ctx.Done():
 			timer.Stop()
+			wg.Wait()
 			return ctx.Err()
 		case <-timer.C:
-			if err := executor.executeJob(ctx, job); err != nil {
-				if config.serialExec && err.Error() == "skipped: another job is running" {
-					log.Printf("Skipping job at %s: previous job is still running",
-						job.execTime.Format("15:04:05"))
-				} else {
-					log.Printf("Error executing job: %v", err)
-				}
+			if !executor.begin() {
+				log.Printf("Skipping job at %s: previous job is still running",
+					job.execTime.Format("15:04:05"))
+				continue
 			}
+			wg.Add(1)
+			go func(job Job) {
+				defer wg.Done()
+				defer executor.end()
+				executor.execute(ctx, job)
+			}(job)
 		}
 	}
 
+	wg.Wait()
 	log.Println("All jobs completed. Exiting...")
 	return nil
 }

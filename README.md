@@ -24,14 +24,6 @@ Use with cron for daily scheduling:
 0 0 * * * /usr/local/bin/chronornd-job -command="/path/to/script.sh" -n=5 -serial
 ```
 
-## Installation
-
-Build from source:
-
-```bash
-$ go build
-```
-
 ## Usage
 
 Basic command format:
